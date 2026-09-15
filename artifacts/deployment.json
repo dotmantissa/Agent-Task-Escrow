@@ -1,0 +1,24 @@
+{
+  "network": "studionet",
+  "contractName": "AgentTaskEscrow",
+  "contractAddress": "0x994dEe34c3102Cb0148553b811BEfa66C4569478",
+  "deployerAddress": "0xBC1399c55538eC034d4Da550C03c34Ae0C357f53",
+  "deploymentTransaction": "0xa4623a0cd793bd3cfd5e15ea028cccab2348c746b353ec3cc13c257c2df2aa1c",
+  "rpc": "https://studio.genlayer.com/api",
+  "chainId": "61999",
+  "runner": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6",
+  "schemaMethods": [
+    "cancel_task",
+    "claim_deadline_refund",
+    "create_task",
+    "get_agent_tasks",
+    "get_client_tasks",
+    "get_submission",
+    "get_task",
+    "get_task_count",
+    "get_total_escrow_locked",
+    "preview_payout",
+    "settle_payout",
+    "submit_deliverable"
+  ]
+}

@@ -1,0 +1,15 @@
+[project]
+name = "agent-task-escrow"
+version = "1.0.0"
+description = "Agent Task Escrow: GenLayer primitive for subjective deliverable adjudication and rubric based settlement"
+requires-python = ">=3.10"
+
+[project.dependencies]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
