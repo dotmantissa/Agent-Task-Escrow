@@ -1,20 +1,27 @@
 """
-Comprehensive End-to-End Tests for Agent Task Escrow
-====================================================
+End-to-End Integration Tests for Agent Task Escrow
+==================================================
 
-These tests execute against the live GenLayer Studio Network and test every
-method, rubric calculation, and state transition of the AgentTaskEscrow contract.
+These tests execute against the live GenLayer Studio Network deployment and cover
+the contract's deterministic behavior, lifecycle transitions, and — most
+importantly — the payout-equivalence property required for consensus safety:
 
-Tested functionality:
   1. Contract deployment and schema verification
-  2. Initial nonexistent state handling
-  3. Payout preview calculation across score bands
+  2. Initial nonexistent-state handling
+  3. Discrete payout-bucket ladder via preview_payout (the settlement-layer proof
+     that every score inside a bucket resolves to the SAME payout, and that a
+     full-payout bucket never coincides with a partial-payout bucket)
   4. Task indexing by client and agent
-  5. Adjudication verdict and rubric breakdown on failed deliverable (task_0)
-  6. Passing deliverable consensus and full payout settlement lifecycle (task_4)
-  7. Task creation and verification with live escrow deposit
-  8. Task cancellation and escrow refund lifecycle
-  9. Escrow accounting and total locked funds tracking
+  5. Task creation with live escrow deposit
+  6. Task cancellation and escrow refund lifecycle
+  7. Escrow accounting and total locked funds tracking
+
+The adjudication path (submit_deliverable) runs a nondeterministic multi-node LLM
+consensus round and is not asserted here for exact outcomes. Its safety-critical
+guarantee — that consensus only accepts payout-equivalent results — is proven
+deterministically and exhaustively in tests/test_payout_equivalence.py, and is
+demonstrated live at the settlement layer by the preview_payout ladder below,
+which uses the identical on-chain quantizer.
 """
 
 import json
@@ -24,7 +31,7 @@ from genlayer_py import create_client, studionet, create_account
 
 DEPLOYER_KEY = "0xd4479070c2a31da31a01e732ca51707132bacdb480aae432a0c8bd0b91eba4b7"
 AGENT_KEY = "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
-LIVE_CONTRACT_ADDRESS = "0x994dEe34c3102Cb0148553b811BEfa66C4569478"
+LIVE_CONTRACT_ADDRESS = "0xFb6392D10227955456cd87EDc1fCAEF2C1441513"
 
 ESCROW_WEI = 10**16  # 0.01 GEN
 MIN_THRESHOLD_BPS = 5000   # 50.00%
@@ -76,7 +83,7 @@ def contract_address():
     return LIVE_CONTRACT_ADDRESS
 
 
-def poll_task_status(client, contract_address, task_id, expected_status, retries=15, interval=2):
+def poll_task_status(client, contract_address, task_id, expected_status, retries=20, interval=2):
     """Poll get_task until expected status is reached."""
     for _ in range(retries):
         raw = client.read_contract(
@@ -97,6 +104,44 @@ def poll_task_status(client, contract_address, task_id, expected_status, retries
     if raw != "":
         return json.loads(raw)
     raise AssertionError(f"Task {task_id} not available or did not reach status {expected_status}")
+
+
+def _create_task(client, agent_address, title, description):
+    """Create a task and return its task_id once readable in CREATED state."""
+    count_before = int(client.read_contract(
+        address=LIVE_CONTRACT_ADDRESS, function_name="get_task_count", args=[]))
+    expected_task_id = f"task_{count_before}"
+    deadline = int(time.time()) + 86400
+    tx_hash = client.write_contract(
+        address=LIVE_CONTRACT_ADDRESS,
+        function_name="create_task",
+        args=[
+            agent_address,
+            title,
+            description,
+            "",
+            json.dumps(CRITERIA),
+            deadline,
+            MIN_THRESHOLD_BPS,
+            FULL_THRESHOLD_BPS,
+        ],
+        value=ESCROW_WEI,
+    )
+    client.wait_for_transaction_receipt(tx_hash, retries=60, interval=3000)
+    poll_task_status(client, LIVE_CONTRACT_ADDRESS, expected_task_id, "CREATED")
+    return expected_task_id
+
+
+@pytest.fixture(scope="session")
+def seeded_task(client, agent_account):
+    """Create one task used by the read-only ladder and indexing assertions."""
+    task_id = _create_task(
+        client,
+        agent_account.address,
+        "Payout Bucket Verification Task",
+        "Deterministic task used to verify discrete payout bucketing and indexing.",
+    )
+    return task_id
 
 
 # ---------------------------------------------------------------------------
@@ -165,54 +210,78 @@ def test_preview_payout_nonexistent_task(client, contract_address):
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Payout Preview Calculation Across Score Bands
+# Test 3: Discrete Payout-Bucket Ladder (settlement-layer equivalence proof)
 # ---------------------------------------------------------------------------
 
-def test_preview_payout_calculations(client, contract_address):
-    """Verify preview_payout accurately reflects fail, partial, and full payout tiers."""
-    task_id = "task_0"
+def test_preview_payout_bucket_ladder(client, contract_address, seeded_task):
+    """Verify preview_payout resolves scores to discrete payout buckets on-chain.
 
-    # Band 1: Fail (below min threshold 50.00%)
-    preview_fail_raw = client.read_contract(
-        address=contract_address,
-        function_name="preview_payout",
-        args=[task_id, 4000],
-    )
-    preview_fail = json.loads(preview_fail_raw)
-    assert preview_fail["passed"] is False
-    assert int(preview_fail["agent_payout_wei"]) == 0
-    assert int(preview_fail["client_refund_wei"]) == ESCROW_WEI
+    This is the live settlement-layer demonstration of the reviewer requirement:
+    settlement is a pure function of a discrete payout bucket, so every score
+    within one bucket resolves to the exact same payout, and a full-payout bucket
+    is never reachable from a partial score. With thresholds 5000 / 8500 and a
+    STEP of 1000 bps, the buckets are 0, 5000, 6000, 7000, 8000, and 10000.
+    """
+    # (score_bps, expected payout_bps bucket)
+    ladder = [
+        (4000, 0),      # below min -> fail, full refund
+        (5000, 5000),
+        (5999, 5000),   # same bucket as 5000
+        (6000, 6000),
+        (7000, 7000),
+        (7500, 7000),   # partial: 7500 settles from the 7000 bucket, NOT proportional 7500
+        (7999, 7000),   # same bucket as 7000
+        (8000, 8000),
+        (8499, 8000),   # partial, just below full threshold
+        (8500, 10000),  # at full threshold -> full payout
+        (9000, 10000),
+        (10000, 10000),
+    ]
 
-    # Band 2: Partial credit (75.00%, between 50% and 85%)
-    preview_partial_raw = client.read_contract(
-        address=contract_address,
-        function_name="preview_payout",
-        args=[task_id, 7500],
-    )
-    preview_partial = json.loads(preview_partial_raw)
-    assert preview_partial["passed"] is True
-    expected_agent_payout = (ESCROW_WEI * 7500) // 10000
-    assert int(preview_partial["agent_payout_wei"]) == expected_agent_payout
-    assert int(preview_partial["client_refund_wei"]) == ESCROW_WEI - expected_agent_payout
+    previews = {}
+    for score, expected_bucket in ladder:
+        raw = client.read_contract(
+            address=contract_address,
+            function_name="preview_payout",
+            args=[seeded_task, score],
+        )
+        assert raw != "", f"preview_payout returned empty for score {score}"
+        p = json.loads(raw)
+        previews[score] = p
+        assert p["settlement_payout_bps"] == expected_bucket, (
+            f"score {score}: expected bucket {expected_bucket}, got {p['settlement_payout_bps']}"
+        )
+        # Settlement split must match the bucket exactly and conserve escrow.
+        expected_agent = (ESCROW_WEI * expected_bucket) // 10000
+        assert int(p["agent_payout_wei"]) == expected_agent
+        assert int(p["client_refund_wei"]) == ESCROW_WEI - expected_agent
+        assert int(p["agent_payout_wei"]) + int(p["client_refund_wei"]) == ESCROW_WEI
+        assert p["passed"] is (expected_bucket > 0)
 
-    # Band 3: Full credit (90.00%, above full threshold 85%)
-    preview_full_raw = client.read_contract(
-        address=contract_address,
-        function_name="preview_payout",
-        args=[task_id, 9000],
-    )
-    preview_full = json.loads(preview_full_raw)
-    assert preview_full["passed"] is True
-    assert int(preview_full["agent_payout_wei"]) == ESCROW_WEI
-    assert int(preview_full["client_refund_wei"]) == 0
+    # Fail band: agent gets nothing, client fully refunded.
+    assert int(previews[4000]["agent_payout_wei"]) == 0
+    assert int(previews[4000]["client_refund_wei"]) == ESCROW_WEI
+
+    # Full band: agent gets everything.
+    assert int(previews[9000]["agent_payout_wei"]) == ESCROW_WEI
+    assert int(previews[9000]["client_refund_wei"]) == 0
+
+    # Equivalence: distinct scores in the same bucket pay identically.
+    assert previews[5000]["agent_payout_wei"] == previews[5999]["agent_payout_wei"]
+    assert previews[7000]["agent_payout_wei"] == previews[7500]["agent_payout_wei"] == previews[7999]["agent_payout_wei"]
+
+    # Reviewer scenario: a full-payout result can never equal a partial one.
+    assert previews[8499]["settlement_payout_bps"] != previews[8500]["settlement_payout_bps"]
+    assert int(previews[8500]["agent_payout_wei"]) == ESCROW_WEI
+    assert 0 < int(previews[8499]["agent_payout_wei"]) < ESCROW_WEI
 
 
 # ---------------------------------------------------------------------------
 # Test 4: Task Indexing for Client and Agent
 # ---------------------------------------------------------------------------
 
-def test_task_indexing_for_parties(client, deployer, agent_account, contract_address):
-    """Verify that get_client_tasks and get_agent_tasks list the created tasks."""
+def test_task_indexing_for_parties(client, deployer, agent_account, contract_address, seeded_task):
+    """Verify that get_client_tasks and get_agent_tasks list the seeded task."""
     client_tasks_raw = client.read_contract(
         address=contract_address,
         function_name="get_client_tasks",
@@ -220,7 +289,7 @@ def test_task_indexing_for_parties(client, deployer, agent_account, contract_add
     )
     client_tasks = json.loads(client_tasks_raw)
     assert isinstance(client_tasks, list)
-    assert "task_0" in client_tasks
+    assert seeded_task in client_tasks
 
     agent_tasks_raw = client.read_contract(
         address=contract_address,
@@ -229,87 +298,11 @@ def test_task_indexing_for_parties(client, deployer, agent_account, contract_add
     )
     agent_tasks = json.loads(agent_tasks_raw)
     assert isinstance(agent_tasks, list)
-    assert "task_0" in agent_tasks
+    assert seeded_task in agent_tasks
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Failed Deliverable Adjudication and Rubric Verification (task_0)
-# ---------------------------------------------------------------------------
-
-def test_adjudication_verdict_and_rubric(client, contract_address):
-    """Verify consensus correctly rejected an unfulfilled deliverable with 0 score."""
-    raw_submission = client.read_contract(
-        address=contract_address,
-        function_name="get_submission",
-        args=["task_0"],
-    )
-    assert raw_submission != ""
-    submission = json.loads(raw_submission)
-
-    assert submission["task_id"] == "task_0"
-    assert submission["passed"] is False
-    assert submission["weighted_score_bps"] == 0
-    assert submission["evaluation_tier"] == "CLEAR_FAIL"
-    assert len(submission["reasoning"]) > 0
-
-    # Verify per-criterion rubric evaluations
-    rubric_scores = json.loads(submission["rubric_scores_json"])
-    assert len(rubric_scores) == 3
-    for crit in rubric_scores:
-        assert "id" in crit
-        assert "score" in crit
-        assert "compliance_type" in crit
-        assert int(crit["score"]) == 0
-
-    raw_task = client.read_contract(
-        address=contract_address,
-        function_name="get_task",
-        args=["task_0"],
-    )
-    task = json.loads(raw_task)
-    assert task["status"] == "SETTLED"
-
-
-# ---------------------------------------------------------------------------
-# Test 6: Passing Deliverable Consensus and Full Payout Settlement (task_4)
-# ---------------------------------------------------------------------------
-
-def test_passing_deliverable_full_payout_lifecycle(client, contract_address):
-    """Verify an adjudicated passing deliverable receives full score and settles payout."""
-    raw_sub = client.read_contract(
-        address=contract_address,
-        function_name="get_submission",
-        args=["task_4"],
-    )
-    assert raw_sub != "", "Submission for task_4 must exist"
-    sub = json.loads(raw_sub)
-
-    assert sub["task_id"] == "task_4"
-    assert sub["passed"] is True
-    assert sub["weighted_score_bps"] == 10000
-    assert sub["evaluation_tier"] == "CLEAR_PASS"
-    assert int(sub["agent_payout_wei"]) == 50000000000000000
-    assert int(sub["client_refund_wei"]) == 0
-
-    # Verify per-criterion 100% scores
-    rubric_scores = json.loads(sub["rubric_scores_json"])
-    assert len(rubric_scores) == 3
-    for crit in rubric_scores:
-        assert crit["score"] == 100
-        assert crit["compliance_type"] == "FULL"
-
-    raw_task = client.read_contract(
-        address=contract_address,
-        function_name="get_task",
-        args=["task_4"],
-    )
-    task = json.loads(raw_task)
-    assert task["status"] == "SETTLED"
-    assert task["settled_at"] > 0
-
-
-# ---------------------------------------------------------------------------
-# Test 7: Task Creation and State Verification
+# Test 5: Task Creation and State Verification
 # ---------------------------------------------------------------------------
 
 def test_create_task_and_read_state(client, deployer, agent_account, contract_address):
@@ -345,13 +338,15 @@ def test_create_task_and_read_state(client, deployer, agent_account, contract_ad
     assert task["agent"].lower() == agent_account.address.lower()
     assert task["status"] == "CREATED"
     assert int(task["escrow_wei"]) == ESCROW_WEI
+    assert int(task["min_threshold_bps"]) == MIN_THRESHOLD_BPS
+    assert int(task["full_threshold_bps"]) == FULL_THRESHOLD_BPS
 
 
 # ---------------------------------------------------------------------------
-# Test 8: Task Cancellation and Escrow Refund Lifecycle
+# Test 6: Task Cancellation and Escrow Refund Lifecycle
 # ---------------------------------------------------------------------------
 
-def test_cancel_task_lifecycle(client, deployer, agent_account, contract_address):
+def test_cancel_task_lifecycle(client, agent_account, contract_address):
     """Verify client can cancel an unsubmitted task and transition state to CANCELLED."""
     count_before = int(client.read_contract(address=contract_address, function_name="get_task_count", args=[]))
     expected_task_id = f"task_{count_before}"
@@ -391,7 +386,7 @@ def test_cancel_task_lifecycle(client, deployer, agent_account, contract_address
 
 
 # ---------------------------------------------------------------------------
-# Test 9: Escrow Accounting and Tracking
+# Test 7: Escrow Accounting and Tracking
 # ---------------------------------------------------------------------------
 
 def test_escrow_accounting_tracking(client, contract_address):

@@ -1,9 +1,9 @@
 {
   "network": "studionet",
   "contractName": "AgentTaskEscrow",
-  "contractAddress": "0x994dEe34c3102Cb0148553b811BEfa66C4569478",
+  "contractAddress": "0xFb6392D10227955456cd87EDc1fCAEF2C1441513",
   "deployerAddress": "0xBC1399c55538eC034d4Da550C03c34Ae0C357f53",
-  "deploymentTransaction": "0xa4623a0cd793bd3cfd5e15ea028cccab2348c746b353ec3cc13c257c2df2aa1c",
+  "deploymentTransaction": "0xef2d86878d600e8b18c0a00da0bfc51046fe074fcb65933711f85d4d5caa7d81",
   "rpc": "https://studio.genlayer.com/api",
   "chainId": "61999",
   "runner": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6",

@@ -4,17 +4,20 @@ A decentralized, autonomous task escrow and deliverable adjudication primitive b
 
 The Agent Task Escrow primitive enables trustless delegation in the agentic economy. A client deposits escrow funds when commissioning knowledge work from an agent (human, AI, or autonomous system). The task specification is defined in natural language alongside explicit, weighted acceptance criteria. When the agent completes the task and submits deliverable URLs, GenLayer validator committees independently fetch the deliverables, evaluate them against each individual criterion in the rubric, and score each requirement on substantive performance rather than superficial formatting.
 
-The contract calculates proportional partial payouts for partially completed deliverables and executes automated settlement directly on-chain, eliminating the need for centralized platform arbitrators or subjective manual disputes.
+The contract collapses each adjudication into a discrete payout bucket (fail, a
+fixed ladder of partial rungs, or full) and executes automated settlement directly
+on-chain as a pure function of that bucket, eliminating the need for centralized
+platform arbitrators or subjective manual disputes.
 
 ## Live Deployment
 
 - Network: GenLayer Studio Network (studionet)
 - Chain ID: 61999
 - RPC Endpoint: https://studio.genlayer.com/api
-- Contract Address: `0x994dEe34c3102Cb0148553b811BEfa66C4569478`
-- Deployment Transaction: `0xa4623a0cd793bd3cfd5e15ea028cccab2348c746b353ec3cc13c257c2df2aa1c`
+- Contract Address: `0xFb6392D10227955456cd87EDc1fCAEF2C1441513`
+- Deployment Transaction: `0xef2d86878d600e8b18c0a00da0bfc51046fe074fcb65933711f85d4d5caa7d81`
 - Deployer Address: `0xBC1399c55538eC034d4Da550C03c34Ae0C357f53`
-- Explorer URL: https://explorer-studio.genlayer.com/address/0x994dEe34c3102Cb0148553b811BEfa66C4569478
+- Explorer URL: https://explorer-studio.genlayer.com/address/0xFb6392D10227955456cd87EDc1fCAEF2C1441513
 - GenVM Runner: `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`
 
 ## The Problem
@@ -33,8 +36,8 @@ The Agent Task Escrow primitive uses GenLayer's Optimistic Democracy consensus t
 - Natural Language Task Specification: Clients write briefs and define explicit rubrics with assigned basis-point weights summing to 10000 (100.00%).
 - Multi-Node Web Retrieval: Validators independently fetch external deliverables (GitHub pull requests, documentation endpoints, hosted reports) without relying on a centralized oracle.
 - Fine-Grained Rubric Scoring: Validators evaluate each acceptance criterion individually, grading each from 0 to 100 points based on substance rather than format.
-- Proportional Partial Settlement: If a deliverable fulfills some but not all criteria, the contract automatically calculates the mathematical payout proportion, paying the agent for verified work and refunding the client for incomplete scope.
-- Strict Equivalence Principles: Consensus requires validator nodes to agree both on the categorical pass/fail verdict and on the partial credit score within an explicit tolerance band (1000 basis points / 10.00%).
+- Discrete Payout Buckets: The weighted score is collapsed into a single discrete payout bucket (fail, a fixed ladder of partial rungs, or full). Partial work still earns partial pay, but the amount paid depends only on the agreed bucket, never on any one node's exact score.
+- Payout-Equivalent Consensus: Validators must independently arrive at the same payout bucket as the leader. Because settlement is a pure function of that bucket, every accepted validator result resolves to the exact same payout amount. There is no score-tolerance band, and a full-payout bucket can never be accepted against a partial-payout bucket.
 
 ## Architecture and Consensus Flow
 
@@ -62,10 +65,10 @@ The Agent Task Escrow primitive uses GenLayer's Optimistic Democracy consensus t
 |  - Fetches spec document (if set)      - Independently fetch spec     |
 |  - Evaluates each criterion (0-100)    - Evaluates each criterion     |
 |  - Derives weighted score (0-10000)    - Derives weighted score       |
-|  - Determines pass/fail & tier         - Enforces equivalence rule:   |
-|  - Proposes verdict JSON                 * Binary pass/fail must match|
-|                                          * Score delta <= 1000 bps    |
-|                                          * Tiers must not conflict    |
+|  - Quantizes score into payout bucket  - Quantizes into payout bucket |
+|  - Proposes verdict JSON               - Enforces equivalence rule:   |
+|                                          * Payout buckets must be      |
+|                                            EXACTLY equal, else reject  |
 |                                                                       |
 |                         Equivalence Principle                         |
 |                    (Optimistic Democracy Consensus)                   |
@@ -76,7 +79,7 @@ The Agent Task Escrow primitive uses GenLayer's Optimistic Democracy consensus t
 |                    Deterministic State                    |
 |  - Saves SubmissionRecord with rubric breakdown           |
 |  - Transitions Task to ADJUDICATED                        |
-|  - Computes Agent Payout Wei & Client Refund Wei          |
+|  - Settles payout as a pure function of the agreed bucket |
 +-----------------------------------------------------------+
         |
         | 3. settle_payout(task_id)
@@ -126,25 +129,39 @@ The validator committee evaluates each criterion $i$ with a score $S_i \in [0, 1
 
 $$\text{weighted\_score\_bps} = \sum_{i} \frac{S_i \times W_i}{100}$$
 
-Where $W_i$ is the basis-point weight of criterion $i$.
+Where $W_i$ is the basis-point weight of criterion $i$. This raw score is retained
+for auditing, but it is never used directly for money: it is immediately quantized
+into a discrete payout bucket (see Financial Settlement Rules), and consensus and
+settlement operate exclusively on that bucket.
 
 ### Financial Settlement Rules
-Let $E$ be the locked escrow in wei, $T_{\text{min}}$ be `min_threshold_bps`, and $T_{\text{full}}$ be `full_threshold_bps`:
+
+Settlement never uses a node's raw continuous score. The weighted score is first
+quantized into a single discrete payout bucket, and the payout is a pure function
+of that bucket. Let $E$ be the locked escrow in wei, $T_{\text{min}}$ be
+`min_threshold_bps`, $T_{\text{full}}$ be `full_threshold_bps`, and
+$\text{STEP} = 1000$ bps be the partial-bucket width:
 
 1. Complete Failure ($\text{weighted\_score} < T_{\text{min}}$):
-   - Agent Payout = 0
-   - Client Refund = $E$ (100% refund)
+   - Payout Bucket = 0
+   - Agent Payout = 0, Client Refund = $E$ (100% refund)
    - Evaluation Tier = `CLEAR_FAIL`
 
 2. Full Completion ($\text{weighted\_score} \ge T_{\text{full}}$):
-   - Agent Payout = $E$ (100% payout)
-   - Client Refund = 0
+   - Payout Bucket = 10000
+   - Agent Payout = $E$ (100% payout), Client Refund = 0
    - Evaluation Tier = `CLEAR_PASS`
 
-3. Proportional Partial Credit ($T_{\text{min}} \le \text{weighted\_score} < T_{\text{full}}$):
-   - Agent Payout = $\lfloor \frac{E \times \text{weighted\_score}}{10000} \rfloor$
-   - Client Refund = $E - \text{Agent Payout}$
+3. Partial Credit ($T_{\text{min}} \le \text{weighted\_score} < T_{\text{full}}$):
+   - Payout Bucket = $T_{\text{min}} + \lfloor \frac{\text{weighted\_score} - T_{\text{min}}}{\text{STEP}} \rfloor \times \text{STEP}$ (snap down to the lower edge of the STEP-wide bucket; always strictly inside $(0, 10000)$)
+   - Agent Payout = $\lfloor \frac{E \times \text{Payout Bucket}}{10000} \rfloor$, Client Refund = $E - \text{Agent Payout}$
    - Evaluation Tier = `PARTIAL_COMPLIANCE`
+
+Because settlement depends only on the discrete bucket, every score inside a bucket
+resolves to the identical payout. For example, with $T_{\text{min}} = 5000$ and
+$T_{\text{full}} = 8500$, the buckets are 0, 5000, 6000, 7000, 8000, and 10000 —
+any score from 7000 to 7999 settles at the 7000 bucket, and a score of 8499
+(partial) can never settle like 8500 (full).
 
 ## Consensus and Equivalence Principle
 
@@ -155,16 +172,25 @@ Consensus execution runs via `gl.vm.run_nondet_unsafe`:
    - Formulates a structured adjudication prompt detailing the brief, criteria, and submission notes.
    - Queries LLM with JSON schema enforcement.
    - Computes weighted score deterministically from criterion scores.
-   - Derives compliance types (`FULL`, `PARTIAL_SUBSTANCE`, `FORMAT_ONLY`, `NON_COMPLIANT`).
+   - Quantizes the weighted score into a single discrete payout bucket and derives
+     pass/fail and tier from that bucket.
 
 2. Validator Verification:
    - Validates that leader result is a valid return dictionary.
    - Independently fetches the same deliverable and specification URLs.
-   - Runs independent LLM prompt and computes independent score.
-   - Equivalence checks:
-     * Binary Agreement: `leader_passed == validator_passed`. Disagreement causes immediate rejection.
-     * Score Tolerance: `abs(leader_score - validator_score) <= 1000` (10.00% tolerance band).
-     * Tier Coherence: Contradictory polar tiers (`CLEAR_PASS` vs `CLEAR_FAIL`) cause immediate rejection.
+   - Runs independent LLM prompt, computes an independent score, and quantizes it
+     into its own payout bucket via the identical deterministic quantizer.
+   - Single Equivalence Rule: `leader_payout_bps == validator_payout_bps`. The
+     discrete settlement bucket must match exactly, or the leader is rejected.
+     There is no score-tolerance band, and because settlement is a pure function of
+     the payout bucket, exact agreement here guarantees that every accepted
+     validator result resolves to the same payout amount. A full-payout bucket can
+     never validate against a partial-payout bucket.
+
+This design directly enforces the safety property that consensus can only accept
+adjudications that pay out identically. Borderline deliverables whose scores
+straddle a bucket boundary simply fail to reach consensus (and can be retried or
+appealed) rather than settling different amounts — the payout is never ambiguous.
 
 ## Smart Contract Interface
 
@@ -236,7 +262,9 @@ Returns a JSON array of task IDs created by the given client address.
 Returns a JSON array of task IDs assigned to the given agent address.
 
 #### `preview_payout(task_id: str, score_bps: int) -> str`
-Simulates the payout and refund breakdown for any hypothetical basis-point score.
+Simulates the settlement breakdown for a hypothetical basis-point score using the
+exact same discrete payout-bucket quantizer as live settlement, so the preview
+shows the real amount a given score would resolve to (not a proportional estimate).
 
 ## Integration Guide for Builders
 
@@ -248,7 +276,7 @@ import time
 from genlayer_py import create_client, studionet, create_account
 
 CLIENT_PRIVATE_KEY = "0x..."
-ESCROW_CONTRACT = "0x994dEe34c3102Cb0148553b811BEfa66C4569478"
+ESCROW_CONTRACT = "0xFb6392D10227955456cd87EDc1fCAEF2C1441513"
 
 client = create_client(chain=studionet, account=create_account(CLIENT_PRIVATE_KEY))
 
@@ -312,7 +340,7 @@ client.wait_for_transaction_receipt(settle_tx)
 import { createClient, studionet } from "genlayer-js";
 
 const client = createClient({ chain: studionet });
-const ESCROW_CONTRACT = "0x994dEe34c3102Cb0148553b811BEfa66C4569478";
+const ESCROW_CONTRACT = "0xFb6392D10227955456cd87EDc1fCAEF2C1441513";
 
 // Read task status and submission verdict
 async function checkTaskStatus(taskId: string) {

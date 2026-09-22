@@ -34,29 +34,35 @@ Optimistic Democracy:
 2. Rubric-Based Scoring: Validators do not give a simplistic binary answer. They
    score each acceptance criterion individually and calculate a weighted overall
    result in basis points (0 to 10000).
-3. Partial Payout Support: When work is partially complete, the contract calculates
-   a proportional payout for the agent and refunds the remainder to the client.
-4. Equivalence Principle: Validators must agree both on the baseline pass/fail
-   outcome and on the partial credit score within a defined tolerance band.
+3. Discrete Payout Buckets: The weighted score is collapsed into a single discrete
+   payout bucket (fail / a fixed set of partial rungs / full). Settlement is a pure
+   function of that bucket, so partial work still earns partial pay without the
+   payout depending on any one node's exact score.
+4. Payout-Equivalent Consensus: Validators must independently arrive at the SAME
+   payout bucket as the leader. Consensus over the payout itself guarantees that
+   every accepted result settles the identical amount.
 
 Consensus Model
 ---------------
 Adjudication executes via gl.vm.run_nondet_unsafe with a custom leader/validator
-equivalence rule:
+equivalence rule defined on the settlement payout, not on the raw score:
 - Leader:
   1. Fetches deliverable URLs and the task specification URL (if provided).
   2. Parses acceptance criteria and prompts the LLM to score each criterion
      from 0 to 100 based on substance compliance, format compliance, and scope.
-  3. Derives the weighted overall score and pass/fail determination.
-  4. Returns structured JSON containing individual rubric scores and reasoning.
+  3. Derives the weighted overall score, then quantizes it into a single discrete
+     payout bucket (payout_bps) using the task's thresholds.
+  4. Returns structured JSON containing the payout bucket, individual rubric
+     scores, and reasoning.
 - Validator:
   1. Independently fetches the same deliverable and specification URLs.
-  2. Independently prompts the LLM and calculates criterion scores.
-  3. Enforces equivalence:
-     - Both nodes must agree on the pass/fail determination.
-     - Both nodes must agree on the weighted score within a tolerance band of
-       1000 basis points (10.00%).
-     - Reject if evaluation tiers conflict (e.g. CLEAR_PASS vs CLEAR_FAIL).
+  2. Independently prompts the LLM, calculates criterion scores, and derives its
+     own payout bucket via the identical deterministic quantizer.
+  3. Enforces a single equivalence rule: the leader's payout bucket must EXACTLY
+     equal the validator's payout bucket. There is no score-tolerance band, and a
+     full-payout bucket can never be accepted against a partial-payout bucket.
+     Because settlement is a pure function of the payout bucket, every accepted
+     validator result resolves to the same payout amount.
 
 Contract Lifecycle
 ------------------
@@ -128,6 +134,7 @@ class SubmissionRecord:
     rubric_scores_json: str
     evaluation_tier: str
     reasoning: str
+    payout_bps: u32
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +168,17 @@ def _coerce_bool(raw: typing.Any) -> bool:
     if txt in ("false", "no", "0", "fail", "failed", "rejected"):
         return False
     return False
+
+
+# ---------------------------------------------------------------------------
+# Settlement quantization
+# ---------------------------------------------------------------------------
+# Partial payouts are quantized to fixed-width buckets so that consensus resolves
+# to a single discrete payout, never a continuous per-node score. A validator only
+# accepts the leader when it independently lands in the same bucket, which makes
+# every accepted result settle the exact same amount. STEP is the bucket width in
+# basis points across the partial band (1000 bps = 10% of escrow).
+PARTIAL_PAYOUT_STEP_BPS = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -255,20 +273,51 @@ class AgentTaskEscrow(gl.Contract):
         )
         return sanitized
 
-    def _compute_payout(self, escrow_wei: int, score_bps: int, min_threshold_bps: int, full_threshold_bps: int) -> tuple:
+    def _quantize_payout_bps(self, score_bps: int, min_threshold_bps: int, full_threshold_bps: int) -> int:
         """
-        Calculates agent payout and client refund in wei based on score.
-        - If score < min_threshold_bps: 0 payout, full refund.
-        - If score >= full_threshold_bps: full payout, 0 refund.
-        - Otherwise: proportional payout based on score_bps.
-        """
-        if score_bps < min_threshold_bps:
-            return 0, escrow_wei
-        if score_bps >= full_threshold_bps:
-            return escrow_wei, 0
+        Map a raw weighted score to THE single discrete payout bucket that settlement uses.
 
-        agent_payout = (escrow_wei * score_bps) // 10000
-        client_refund = escrow_wei - agent_payout
+        This function is pure and deterministic: identical inputs always produce an
+        identical output. Consensus is reached on this bucket (not on the raw score),
+        so two nodes either land in the same bucket and settle the exact same amount,
+        or they land in different buckets and consensus rejects. There is no tolerance
+        band that could let materially different payouts be accepted together.
+
+        Buckets (payout expressed in basis points of escrow, 0 to 10000):
+          - score < min_threshold      -> 0      (CLEAR_FAIL: nothing to agent, full refund)
+          - score >= full_threshold    -> 10000  (CLEAR_PASS: full payout, no refund)
+          - otherwise (partial band)   -> min_threshold + k * STEP, the lower edge of the
+                                          STEP-wide bucket the score falls in. This is
+                                          always strictly inside (0, 10000).
+        """
+        s = max(0, min(10000, int(score_bps)))
+        tmin = int(min_threshold_bps)
+        tfull = int(full_threshold_bps)
+
+        if s < tmin:
+            return 0
+        if s >= tfull:
+            return 10000
+
+        # Partial band: snap down to the lower edge of a fixed-width bucket anchored at
+        # the minimum threshold. offset <= (s - tmin) so the payout is always < tfull,
+        # and >= tmin so it is always > 0. Both nodes compute this identically.
+        step = PARTIAL_PAYOUT_STEP_BPS
+        offset = ((s - tmin) // step) * step
+        payout = tmin + offset
+        return max(0, min(10000, payout))
+
+    def _settlement_amounts(self, escrow_wei: int, payout_bps: int) -> tuple:
+        """
+        Split escrow into (agent_payout, client_refund) from an agreed payout bucket.
+
+        Settlement is a pure function of payout_bps only. Because consensus already
+        forced every accepting validator to agree on payout_bps exactly, this split is
+        identical for every node — the raw leader score is never used to size the payout.
+        """
+        p = max(0, min(10000, int(payout_bps)))
+        agent_payout = (int(escrow_wei) * p) // 10000
+        client_refund = int(escrow_wei) - agent_payout
         return agent_payout, client_refund
 
     # ------------------------------------------------------------------
@@ -566,15 +615,19 @@ Respond with a single valid JSON object formatted exactly as:
                 computed_score_bps += (item_score * weight) // 100
 
             computed_score_bps = max(0, min(10000, computed_score_bps))
-            passed = bool(computed_score_bps >= min_thresh_mem)
 
-            tier = str(parsed.get("evaluation_tier", "")).strip().upper()
-            if computed_score_bps >= full_thresh_mem:
+            # Collapse the raw weighted score into the single discrete payout bucket
+            # that consensus and settlement operate on. pass/fail and tier are derived
+            # from this bucket so they can never disagree with the money that is paid.
+            payout_bps = self._quantize_payout_bps(computed_score_bps, min_thresh_mem, full_thresh_mem)
+            passed = bool(payout_bps > 0)
+
+            if payout_bps >= 10000:
                 tier = "CLEAR_PASS"
-            elif passed:
-                tier = "PARTIAL_COMPLIANCE"
-            else:
+            elif payout_bps <= 0:
                 tier = "CLEAR_FAIL"
+            else:
+                tier = "PARTIAL_COMPLIANCE"
 
             format_score = max(0, min(100, int(parsed.get("format_compliance_score", 50))))
             substance_score = max(0, min(100, int(parsed.get("substance_compliance_score", 50))))
@@ -584,6 +637,7 @@ Respond with a single valid JSON object formatted exactly as:
             return {
                 "passed": passed,
                 "weighted_score_bps": computed_score_bps,
+                "payout_bps": payout_bps,
                 "evaluation_tier": tier,
                 "criteria_evaluations": sanitized_evals,
                 "format_compliance_score": format_score,
@@ -605,36 +659,28 @@ Respond with a single valid JSON object formatted exactly as:
             else:
                 leader_dict = leaders_raw
 
+            # Independently re-run the full adjudication. The validator forms its own
+            # evidence-based verdict rather than trusting the leader's answer.
             try:
                 mine = leader_fn()
             except Exception:
                 return False
 
-            leader_passed = _coerce_bool(leader_dict.get("passed", False))
-            my_passed = bool(mine["passed"])
-
-            # Rule 1: Both leader and validator MUST agree on the binary pass/fail verdict
-            if leader_passed != my_passed:
-                return False
-
+            # SINGLE EQUIVALENCE RULE: the discrete settlement payout bucket must match
+            # EXACTLY. Settlement is a pure function of payout_bps, so exact agreement
+            # here is both necessary and sufficient to guarantee that every accepted
+            # validator result resolves to the identical payout amount. There is no
+            # score-tolerance band, and no way for a full-payout bucket to be accepted
+            # against a partial-payout bucket — different buckets always reject.
             try:
-                leader_score = int(leader_dict.get("weighted_score_bps", 0))
+                leader_payout = int(leader_dict.get("payout_bps"))
             except Exception:
-                leader_score = 0
-            my_score = int(mine["weighted_score_bps"])
-
-            # Rule 2: Scores must be within tolerance band of 1000 bps (10.00%)
-            if abs(leader_score - my_score) > 1000:
                 return False
 
-            # Rule 3: Evaluation tiers must not conflict sharply
-            leader_tier = str(leader_dict.get("evaluation_tier", "")).strip().upper()
-            my_tier = str(mine["evaluation_tier"]).strip().upper()
-            if (leader_tier == "CLEAR_PASS" and my_tier == "CLEAR_FAIL") or \
-               (leader_tier == "CLEAR_FAIL" and my_tier == "CLEAR_PASS"):
+            if leader_payout < 0 or leader_payout > 10000:
                 return False
 
-            return True
+            return leader_payout == int(mine["payout_bps"])
 
         # Execute multi-validator consensus
         jury_result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
@@ -653,21 +699,36 @@ Respond with a single valid JSON object formatted exactly as:
         # Deterministic settlement calculation and state update
         # -------------------------------------------------------------------
 
-        passed = _coerce_bool(verdict.get("passed", False))
+        # Raw weighted score is retained for transparency/auditing only.
         try:
             score_bps = int(verdict.get("weighted_score_bps", 0))
         except Exception:
             score_bps = 0
         score_bps = max(0, min(10000, score_bps))
 
-        agent_payout, client_refund = self._compute_payout(
-            escrow_mem,
-            score_bps,
-            min_thresh_mem,
-            full_thresh_mem,
-        )
+        # Settlement is driven SOLELY by the consensus payout bucket. Every accepting
+        # validator computed this exact value, so the money paid here is the money the
+        # committee agreed on — never a re-derivation from the leader's raw score. If
+        # payout_bps is somehow absent, fall back to the same deterministic quantizer
+        # (still a bucket, never a continuous proportional payout).
+        try:
+            payout_bps = int(verdict.get("payout_bps"))
+        except Exception:
+            payout_bps = self._quantize_payout_bps(score_bps, min_thresh_mem, full_thresh_mem)
+        payout_bps = max(0, min(10000, payout_bps))
 
-        tier = str(verdict.get("evaluation_tier", "PARTIAL_COMPLIANCE"))
+        agent_payout, client_refund = self._settlement_amounts(escrow_mem, payout_bps)
+
+        # Derive pass/fail and tier from the settled bucket so stored metadata can never
+        # contradict the payout.
+        passed = bool(payout_bps > 0)
+        if payout_bps >= 10000:
+            tier = "CLEAR_PASS"
+        elif payout_bps <= 0:
+            tier = "CLEAR_FAIL"
+        else:
+            tier = "PARTIAL_COMPLIANCE"
+
         reasoning = str(verdict.get("reasoning", ""))[:400]
         rubric_scores = json.dumps(verdict.get("criteria_evaluations", []))
 
@@ -683,6 +744,7 @@ Respond with a single valid JSON object formatted exactly as:
             rubric_scores_json=rubric_scores,
             evaluation_tier=tier,
             reasoning=reasoning,
+            payout_bps=u32(payout_bps),
         )
 
         self.submissions[task_id] = submission
@@ -695,6 +757,7 @@ Respond with a single valid JSON object formatted exactly as:
             "status": "ADJUDICATED",
             "passed": passed,
             "weighted_score_bps": score_bps,
+            "payout_bps": payout_bps,
             "evaluation_tier": tier,
             "agent_payout_wei": str(agent_payout),
             "client_refund_wei": str(client_refund),
@@ -904,6 +967,7 @@ Respond with a single valid JSON object formatted exactly as:
             "submitted_at": int(s.submitted_at),
             "passed": s.passed,
             "weighted_score_bps": int(s.weighted_score_bps),
+            "payout_bps": int(s.payout_bps),
             "agent_payout_wei": str(int(s.agent_payout_wei)),
             "client_refund_wei": str(int(s.client_refund_wei)),
             "rubric_scores_json": s.rubric_scores_json,
@@ -978,6 +1042,9 @@ Respond with a single valid JSON object formatted exactly as:
         """
         Simulate the financial distribution for a hypothetical score on a task.
 
+        Uses the exact same discrete bucketing as live settlement, so the preview
+        shows the real payout that a given weighted score would resolve to.
+
         Parameters
         ----------
         task_id : str
@@ -999,15 +1066,17 @@ Respond with a single valid JSON object formatted exactly as:
         full_bps = int(t.full_threshold_bps)
         score = max(0, min(10000, score_bps))
 
-        agent_payout, client_refund = self._compute_payout(escrow, score, min_bps, full_bps)
+        payout_bps = self._quantize_payout_bps(score, min_bps, full_bps)
+        agent_payout, client_refund = self._settlement_amounts(escrow, payout_bps)
 
         return json.dumps({
             "task_id": task_id,
             "escrow_wei": str(escrow),
             "simulated_score_bps": score,
+            "settlement_payout_bps": payout_bps,
             "min_threshold_bps": min_bps,
             "full_threshold_bps": full_bps,
-            "passed": score >= min_bps,
+            "passed": payout_bps > 0,
             "agent_payout_wei": str(agent_payout),
             "client_refund_wei": str(client_refund),
         }, sort_keys=True)
